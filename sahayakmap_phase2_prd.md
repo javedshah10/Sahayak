@@ -9,7 +9,7 @@
 
 ## 1. Objective
 
-Phase 3 extends SahayakMap from a monitoring and triage tool into a **predictive and autonomous response system** — anticipating crises before gauges confirm them, coordinating multi-agency response, and reaching communities that have gone dark.
+Phase 2 extends SahayakMap from a monitoring and triage tool into a **predictive and autonomous response system** — anticipating crises before gauges confirm them, coordinating multi-agency response, and reaching communities that have gone dark.
 
 ---
 
