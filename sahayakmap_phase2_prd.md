@@ -26,7 +26,7 @@ Phase 2 extends SahayakMap from a monitoring and triage tool into a **predictive
 
 ---
 
-### TASK P3-1 — RAG Historical Intelligence
+### TASK P2-1 — RAG Historical Intelligence
 **New file:** `rag_engine.py`  
 **Depends on:** ChromaDB or Supabase pgvector, historical gauge_readings, past EOC PDFs
 
@@ -53,7 +53,7 @@ Phase 2 extends SahayakMap from a monitoring and triage tool into a **predictive
 
 ---
 
-### TASK P3-2 — Intelligent Voice Calling
+### TASK P2-2 — Intelligent Voice Calling
 **New file:** `voice_alert.py`  
 **Depends on:** Twilio Voice API, `TWILIO_SID`, `TWILIO_AUTH_TOKEN`
 
@@ -83,7 +83,7 @@ TWILIO_FROM_NUMBER=+1XXXXXXXXXX
 
 ---
 
-### TASK P3-3 — Inundation Extent Overlay
+### TASK P2-3 — Inundation Extent Overlay
 **New file:** `inundation_fetcher.py`  
 **Depends on:** Google Earth Engine credentials OR MODIS NRT Flood API
 
@@ -109,7 +109,7 @@ TWILIO_FROM_NUMBER=+1XXXXXXXXXX
 
 ---
 
-### TASK P3-4 — Predictive Evacuation Windows
+### TASK P2-4 — Predictive Evacuation Windows
 **New file:** `evacuation_planner.py`  
 **Depends on:** ml_forecast.py output, safe_zones table, road_risks table, DEM data (Phase 3 prerequisite)
 
@@ -136,7 +136,7 @@ hours_to_inundation = (elevation - current_wse) / rise_rate
 
 ---
 
-### TASK P3-5 — Silent Zone Detector
+### TASK P2-5 — Silent Zone Detector
 **New file:** `silent_zone_detector.py`  
 **Depends on:** social_signals, boat_assets, gauge_readings, power outage data
 
@@ -168,7 +168,7 @@ SILENT_ZONE_TRIGGER = all of:
 
 ---
 
-### TASK P3-6 — Android APK (2G Lite Mode)
+### TASK P2-6 — Android APK (2G Lite Mode)
 **Depends on:** PWA Service Worker (Phase 2), `/api/pulse` endpoint
 
 **Problem:** Field teams need a native app experience on Android — faster launch, offline capability, push notifications.
@@ -196,7 +196,7 @@ SILENT_ZONE_TRIGGER = all of:
 
 ---
 
-### TASK P3-7 — Daily Intelligence Briefing
+### TASK P2-7 — Daily Intelligence Briefing
 **New file:** `daily_briefing.py`  
 **Depends on:** All existing endpoints + Telegram bot
 
