@@ -90,7 +90,7 @@ def _load_fresh_csv(station: str) -> Optional[pd.DataFrame]:
         import psycopg2, os
         from dotenv import load_dotenv
         load_dotenv()
-        conn = psycopg2.connect(os.getenv("URI",""))
+        conn = psycopg2.connect(os.getenv("URI",""), connect_timeout=3)
         cur = conn.cursor()
         cur.execute(
             "SELECT g.timestamp,g.wse FROM gauge_readings g JOIN stations s ON s.id=g.station_id WHERE s.name=%s AND g.wse IS NOT NULL ORDER BY g.timestamp",

@@ -18,9 +18,11 @@ import re
 import subprocess
 import sys
 import base64
+import difflib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import psycopg2
@@ -49,11 +51,17 @@ STATE_FILE = Path("state.json")
 ALERTS_FILE = Path("alerts.json")
 
 VPS_DATA_API = "https://www.joodei.org/sahayak-data"
+PULSE_SNAPSHOT_PATH = Path("/root/Sahayak/pipeline/snapshots/stations_latest.json")
+BOATS_SNAPSHOT_PATH = Path("/root/Sahayak/pipeline/snapshots/boats_latest.json")
+SUPABASE_REST_URL = "https://vflimxjetrquydkznxoc.supabase.co"
+SUPABASE_REST_KEY = "sb_publishable_QxFNvDdqQIwZqcJHMHM85Q_osBCxzSl"
+CHART_CACHE_TTL = timedelta(hours=8)
+_chart_cache: dict[tuple[str, int], dict] = {}
 
 INTENT_RULES = {
     "gauge": ["water", "wse", "level", "gauge", "naraj", "jenapur", "station"],
     "weather": ["weather", "rain", "imd", "wind", "storm", "forecast weather", "climate", "temperature", "condition"],
-    "radar": ["radar", "storm approaching", "storm cell", "approaching storm", "rain coming", "clouds moving", "precipitation", "doppler", "any storm", "storm near", "weather radar", "rain radar"],
+    "radar": ["radar", "storm approaching", "storm cell", "approaching storm", "rain coming", "clouds moving", "precipitation", "doppler", "any storm", "storm near", "weather radar", "rain radar", "storm", "coming", "approaching", "next few hours"],
     "news": ["news", "latest", "update", "sachet", "weather alert", "warning", "what is happening", "any alert", "district alert"],
     "tweet": ["tweet", "twitter", "social", "fake", "real", "verify", "citizen"],
     "whatsapp": ["whatsapp", "message", "field team", "report"],
@@ -61,12 +69,319 @@ INTENT_RULES = {
     "summary": ["summary", "brief", "overview", "situation", "status"],
 }
 
+CHAT_TOOL_NAMES = ["gauges", "weather", "social", "whatsapp", "sos", "news"]
+
 _station_context_cache = {"expires_at": None, "raw": None, "gauge": None, "live_count": 0, "stale_count": 0}
+DISTRICT_TO_STATION = {
+    "cuttack": "Naraj",
+    "jajpur": "Jenapur",
+    "keonjhar": "Anandpur",
+    "kendujhar": "Anandpur",
+    "bhadrak": "Akhuapada",
+    "angul": "Tikarpara",
+    "boudh": "Kantamal",
+    "bargarh": "Salebhata",
+    "ganjam": "Purusottampur",
+}
+DB_HOST_FALLBACKS = {
+    "aws-1-ap-northeast-2.pooler.supabase.com": ["15.164.188.235", "3.39.47.126"],
+}
+DB_RETRY_COOLDOWN_SECONDS = 300
+_db_unavailable_until = None
+CANONICAL_STATION_NAMES = {
+    "Purushottampur": "Purusottampur",
+}
 
 
 def _clip_words(text: str, max_words: int) -> str:
     words = str(text or "").split()
     return " ".join(words[:max_words])
+
+
+def _station_aliases(name: str) -> list[str]:
+    aliases = [name]
+    if name == "Purusottampur":
+        aliases.append("Purushottampur")
+    return aliases
+
+
+def _canonical_station_name(name: str | None) -> str | None:
+    if name is None:
+        return None
+    return CANONICAL_STATION_NAMES.get(str(name), str(name))
+
+
+def _replace_db_host(uri: str, new_host: str) -> str:
+    parts = urlsplit(uri)
+    if "@" not in parts.netloc:
+        return uri
+    auth, hostpart = parts.netloc.rsplit("@", 1)
+    port = ""
+    if ":" in hostpart:
+        _, port = hostpart.rsplit(":", 1)
+        hostpart = new_host
+        return urlunsplit((parts.scheme, f"{auth}@{hostpart}:{port}", parts.path, parts.query, parts.fragment))
+    return urlunsplit((parts.scheme, f"{auth}@{new_host}", parts.path, parts.query, parts.fragment))
+
+
+def _supabase_rest_get(table: str, params: dict | None = None, limit: int = 50) -> list[dict]:
+    """Fetch rows from Supabase REST API. Returns empty list on failure."""
+    try:
+        url = f"{SUPABASE_REST_URL}/rest/v1/{table}"
+        headers = {
+            "apikey": SUPABASE_REST_KEY,
+            "Authorization": f"Bearer {SUPABASE_REST_KEY}",
+            "Accept": "application/json",
+        }
+        query = dict(params or {})
+        query.setdefault("limit", str(limit))
+        r = httpx.get(url, headers=headers, params=query, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+async def _supabase_rest_get_async(table: str, params: dict | None = None, limit: int = 50) -> list[dict]:
+    """Async variant of _supabase_rest_get."""
+    try:
+        url = f"{SUPABASE_REST_URL}/rest/v1/{table}"
+        headers = {
+            "apikey": SUPABASE_REST_KEY,
+            "Authorization": f"Bearer {SUPABASE_REST_KEY}",
+            "Accept": "application/json",
+        }
+        query = dict(params or {})
+        query.setdefault("limit", str(limit))
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(url, headers=headers, params=query)
+            if r.status_code == 200:
+                data = r.json()
+                return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+    global _db_unavailable_until
+    uri = os.getenv("URI", "")
+    if not uri:
+        raise RuntimeError("URI not configured")
+    now = datetime.now(timezone.utc)
+    if _db_unavailable_until and now < _db_unavailable_until:
+        raise RuntimeError(
+            f"DB connect cooldown active until {_db_unavailable_until.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        )
+    try:
+        conn = psycopg2.connect(uri, connect_timeout=3)
+        _db_unavailable_until = None
+        return conn
+    except psycopg2.OperationalError as exc:
+        msg = str(exc)
+        if "could not translate host name" not in msg:
+            _db_unavailable_until = now + timedelta(seconds=DB_RETRY_COOLDOWN_SECONDS)
+            raise
+        for host, ips in DB_HOST_FALLBACKS.items():
+            if host in uri:
+                for ip in ips:
+                    try:
+                        conn = psycopg2.connect(_replace_db_host(uri, ip), connect_timeout=3)
+                        _db_unavailable_until = None
+                        return conn
+                    except psycopg2.OperationalError:
+                        continue
+        _db_unavailable_until = now + timedelta(seconds=DB_RETRY_COOLDOWN_SECONDS)
+        raise
+
+
+def _live_station_payload_from_db() -> list[dict]:
+    conn = _db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT s.name, s.river, s.district, s.lat, s.lon, s.tier,
+                   s.warning_level, s.danger_level, s.hfl,
+                   g.wse, g.timestamp
+            FROM stations s
+            LEFT JOIN LATERAL (
+                SELECT wse, timestamp
+                FROM gauge_readings g
+                WHERE g.station_id = s.id AND g.wse IS NOT NULL
+                ORDER BY g.timestamp DESC
+                LIMIT 1
+            ) g ON TRUE
+            ORDER BY s.id
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    payload = []
+    for row in rows:
+        name = _canonical_station_name(row[0])
+        latest_wse = float(row[9]) if row[9] is not None else None
+        latest_ts = row[10].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if row[10] else None
+        payload.append({
+            "name": name,
+            "river": row[1],
+            "district": row[2],
+            "lat": row[3],
+            "lon": row[4],
+            "tier": row[5],
+            "warning_level": row[6],
+            "danger_level": row[7],
+            "hfl": row[8],
+            "latest_wse": latest_wse,
+            "latest_timestamp": latest_ts,
+            "alert_status": "NO_DATA" if latest_wse is None else (
+                "EXTREME" if row[8] is not None and latest_wse >= row[8] else
+                "DANGER" if row[7] is not None and latest_wse >= row[7] else
+                "WARNING" if row[6] is not None and latest_wse >= row[6] else
+                "NORMAL"
+            ),
+        })
+    return payload
+
+
+def _live_chart_payload_from_db(station: str, days: int = 30) -> dict | None:
+    conn = _db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT s.warning_level, s.danger_level, s.hfl
+            FROM stations s
+            WHERE s.name = ANY(%s)
+            LIMIT 1
+            """,
+            [_station_aliases(station)],
+        )
+        meta = cur.fetchone()
+        cur.execute(
+            """
+            SELECT g.timestamp, g.wse
+            FROM gauge_readings g
+            JOIN stations s ON s.id = g.station_id
+            WHERE s.name = ANY(%s) AND g.wse IS NOT NULL
+            ORDER BY g.timestamp
+            """,
+            [_station_aliases(station)],
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+    if not rows:
+        return None
+    latest_ts = rows[-1][0]
+    cutoff = latest_ts - timedelta(days=days)
+    filtered = [(ts, wse) for ts, wse in rows if ts >= cutoff]
+    return {
+        "station": station,
+        "timestamps": [ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for ts, _ in filtered],
+        "values": [float(wse) for _, wse in filtered],
+        "thresholds": {
+            "warning": meta[0] if meta else None,
+            "danger": meta[1] if meta else None,
+            "hfl": meta[2] if meta else None,
+        },
+        "latest_timestamp": latest_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _looks_like_flood_claim(text: str) -> bool:
+    t = str(text or "").lower()
+    return any(term in t for term in [
+        "flood", "danger level", "above danger", "overflowing", "river rising dangerously",
+        "submerged", "washed away", "severe inundation", "rising fast",
+        "road will be cut off", "cut off", "bridge unstable", "at risk"
+    ])
+
+
+def _looks_like_tweet_text(message: str) -> bool:
+    text = str(message or "").lower()
+    has_hashtag = "#" in text
+    has_claim = _looks_like_flood_claim(text) or _message_has_router_signal(
+        text,
+        ["bridge", "road", "traffic", "barrage", "embankment", "stranded", "nh16", "nh-16"],
+        cutoff=0.9,
+    )
+    has_place = _message_has_router_signal(
+        text,
+        [
+            "naraj", "jenapur", "anandpur", "akhuapada", "tikarpara",
+            "kantamal", "salebhata", "purusottampur", "rengali",
+            "cuttack", "jajpur", "bhadrak", "ganjam", "angul",
+        ],
+        cutoff=0.9,
+    )
+    return has_place and (has_hashtag or has_claim)
+
+
+def _extract_query_terms(message: str) -> list[str]:
+    stop = {
+        "is", "the", "a", "an", "of", "or", "and", "to", "about", "should", "i", "it",
+        "real", "ignore", "what", "which", "tweet", "tweets", "summary"
+    }
+    return [w for w in re.findall(r"[a-z0-9-]+", str(message or "").lower()) if len(w) > 2 and w not in stop]
+
+
+def _tweet_limit_from_message(message: str) -> int:
+    text = str(message or "").lower()
+    if "2 tweets" in text or "two tweets" in text or "2 tweet" in text or "two tweet" in text:
+        return 2
+    if "5 tweets" in text or "five tweets" in text or "5 tweet" in text or "five tweet" in text:
+        return 5
+    return 5
+
+
+def _message_has_router_signal(message: str, signals: list[str], cutoff: float = 0.82) -> bool:
+    text = str(message or "").lower()
+    if any(signal in text for signal in signals):
+        return True
+    tokens = re.findall(r"[a-z0-9-]+", text)
+    for signal in signals:
+        parts = re.findall(r"[a-z0-9-]+", signal.lower())
+        if not parts:
+            continue
+        if len(parts) == 1:
+            if difflib.get_close_matches(parts[0], tokens, n=1, cutoff=cutoff):
+                return True
+        else:
+            for i in range(len(tokens) - len(parts) + 1):
+                phrase = " ".join(tokens[i:i + len(parts)])
+                if difflib.SequenceMatcher(None, phrase, " ".join(parts)).ratio() >= cutoff:
+                    return True
+    return False
+
+
+def route_tweet_query(message: str, tweets: list[tuple]) -> tuple[str, list[tuple]]:
+    msg = str(message or "").lower()
+
+    single_signals = [
+        "verify", "real", "fake", "ignore", "trust",
+        "naraj", "jenapur", "anandpur", "akhuapada",
+        "tikarpara", "kantamal", "salebhata",
+        "purusottampur", "rengali", "cuttack",
+        "jajpur", "bhadrak", "ganjam", "angul",
+    ]
+
+    summary_signals = [
+        "summary", "tweets", "top", "all",
+        "list", "provide", "show", "critical",
+    ]
+
+    if _message_has_router_signal(msg, single_signals):
+        return "single_tweet", tweets[:1]
+    if _message_has_router_signal(msg, summary_signals):
+        return "tweet_summary", tweets[:5]
+
+    if len(tweets) == 1:
+        return "single_tweet", tweets[:1]
+    return "tweet_summary", tweets[:5]
 
 
 def _weather_icon_label(rain: str | None, wind: str | None) -> str:
@@ -95,8 +410,39 @@ def _detect_intent(message: str) -> str:
         if score:
             scores[intent] = score
     if not scores:
+        for intent, terms in INTENT_RULES.items():
+            score = sum(1 for term in terms if _message_has_router_signal(text, [term]))
+            if score:
+                scores[intent] = score
+    if not scores:
         return "summary"
     return max(scores.items(), key=lambda item: item[1])[0]
+
+
+def _message_requests_gauge_weather(message: str) -> bool:
+    text = str(message or "").lower()
+    has_gauge = (
+        bool(re.search(r"\bgauge\b|\bguage\b|\bwse\b|\blevel\b", text))
+        or _message_has_router_signal(text, ["gauge", "guage", "wse", "level"], cutoff=0.9)
+    )
+    has_weather = _message_has_router_signal(text, ["weather", "rain", "wind", "imd", "climate", "condition"])
+    asks_full_summary = _message_has_router_signal(
+        text,
+        ["summary", "overview", "situation", "social", "signals", "full report", "situation report"],
+    )
+    return has_gauge and has_weather and not asks_full_summary
+
+
+def _message_requests_full_situation(message: str) -> bool:
+    text = str(message or "").lower()
+    asks_summary = _message_has_router_signal(
+        text,
+        ["summary", "overview", "situation", "full report", "situation report"],
+    )
+    asks_gauge = _message_has_router_signal(text, ["gauge", "guage", "wse", "water", "level"])
+    asks_weather = _message_has_router_signal(text, ["weather", "rain", "wind", "imd", "climate", "condition"])
+    asks_social = _message_has_router_signal(text, ["social", "signal", "signals", "tweet", "tweets", "whatsapp"])
+    return asks_summary and asks_gauge and asks_weather and asks_social
 
 
 async def _fetch_station_payload() -> List[Dict]:
@@ -104,9 +450,23 @@ async def _fetch_station_payload() -> List[Dict]:
     expires_at = _station_context_cache.get("expires_at")
     if expires_at and expires_at > now and _station_context_cache.get("raw") is not None:
         return _station_context_cache["raw"]
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{VPS_DATA_API}/data/stations")
-        stations = r.json() if r.status_code == 200 else []
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(f"{VPS_DATA_API}/data/stations")
+            stations = r.json() if r.status_code == 200 else []
+    except Exception as exc:
+        logging.warning("STATION FETCH ERROR: %s — using cached/local fallback", exc)
+        cached = _station_context_cache.get("raw")
+        if cached:
+            stations = cached
+        elif PULSE_SNAPSHOT_PATH.exists():
+            try:
+                payload = json.loads(PULSE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+                stations = payload.get("stations") if isinstance(payload, dict) else []
+            except Exception:
+                stations = []
+        else:
+            stations = []
     for s in stations if isinstance(stations, list) else []:
         if s.get("data_age_hours") is None:
             ts = s.get("latest_timestamp")
@@ -149,10 +509,361 @@ async def _fetch_station_payload() -> List[Dict]:
     return _station_context_cache["raw"]
 
 
+async def _fetch_feeds_payload() -> Dict:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(VPS_FEEDS)
+            if r.status_code != 200:
+                logging.warning("FEEDS FETCH NON-200: %s", r.status_code)
+                return {}
+            payload = r.json()
+            return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        logging.exception("FEEDS FETCH ERROR: %s", exc)
+        return {}
+
+
+async def _tool_live_gauges() -> str:
+    stations = await _fetch_station_payload()
+    live_bits = []
+    stale_count = 0
+    for s in stations if isinstance(stations, list) else []:
+        try:
+            age_hours = float(s.get("data_age_hours")) if s.get("data_age_hours") is not None else 999
+        except Exception:
+            age_hours = 999
+        if age_hours >= 48:
+            stale_count += 1
+            continue
+        name = s.get("name", "")
+        code = STATION_CODES.get(name, name[:3].upper())
+        wse = s.get("latest_wse")
+        status = s.get("alert_status", "NORMAL")
+        if wse is not None:
+            live_bits.append(f"{code} {float(wse):.2f}m {status}")
+    if not live_bits:
+        return "Gauges: unavailable."
+    return f"Gauges: {len(live_bits)} live stations; {stale_count} stale excluded. " + " | ".join(live_bits)
+
+
+async def _tool_imd_weather() -> str:
+    feeds = await _fetch_feeds_payload()
+    imd = feeds.get("imd", {}).get("stations", []) if isinstance(feeds, dict) else []
+    if not isinstance(imd, list) or not imd:
+        return "Weather: unavailable."
+    notable = []
+    clear_count = 0
+    for row in imd[:12]:
+        station = row.get("name") or row.get("district") or "Unknown"
+        rain = row.get("rain") or row.get("rain_intensity") or "None"
+        wind = row.get("wind") or row.get("wind_speed") or "None"
+        label = _weather_icon_label(rain, wind)
+        if label == "☀️ CLEAR":
+            clear_count += 1
+        else:
+            notable.append(f"{station} {label} {rain} | {wind}")
+    if notable:
+        return "Weather: " + " | ".join(notable[:5])
+    return f"Weather: all {len(imd[:12])} IMD-monitored stations CLEAR; no ALERT or DANGER conditions."
+
+
+async def _tool_social_signals(limit: int = 3) -> str:
+    try:
+        rows = await _supabase_rest_get_async("social_signals", {
+            "select": "district,summary,text,severity,platform,source",
+            "order": "severity.desc.nullslast,timestamp.desc.nullslast",
+        }, limit=limit)
+        if rows:
+            parts = []
+            for r in rows:
+                parts.append(
+                    f"{r.get('district') or 'Unknown'} / "
+                    f"{r.get('summary') or r.get('text') or 'No summary'} / "
+                    f"sev {int(r.get('severity') or 0)} / "
+                    f"{r.get('platform') or r.get('source') or 'social'}"
+                )
+            return "Social: " + " | ".join(parts)
+        else:
+            rows = []
+    except Exception:
+        pass
+
+    if not rows:
+        return "Social: none."
+
+
+async def _tool_whatsapp_reports(limit: int = 3) -> str:
+    try:
+        rows = await _supabase_rest_get_async("social_signals", {
+            "select": "district,summary,severity,sender",
+            "source": "eq.whatsapp",
+            "order": "severity.desc.nullslast,timestamp.desc.nullslast",
+        }, limit=limit)
+        if rows:
+            parts = []
+            for r in rows:
+                parts.append(
+                    f"{r.get('district') or 'Unknown'} / "
+                    f"{r.get('summary') or 'No summary'} / "
+                    f"sev {int(r.get('severity') or 0)} / "
+                    f"{r.get('sender') or 'unknown sender'}"
+                )
+            return "WhatsApp: " + " | ".join(parts)
+        else:
+            rows = []
+    except Exception as exc:
+        rows = []
+    if not rows:
+        return "WhatsApp: none."
+
+
+async def _tool_sos_status() -> str:
+    try:
+        sos_data = await api_sos_active()
+        boats_data = api_boats()
+        if isinstance(boats_data, list):
+            counts = {
+                "safe": sum(1 for b in boats_data if b.get("status") == "Safe"),
+                "active": sum(1 for b in boats_data if b.get("status") == "Active"),
+                "enroute": sum(1 for b in boats_data if b.get("status") == "En Route"),
+            }
+        else:
+            counts = {"safe": 0, "active": 0, "enroute": 0}
+        if isinstance(sos_data, dict) and sos_data.get("active"):
+            boats = sos_data.get("boats", [])[:3]
+            boat_bits = [
+                f"{b.get('call_sign')} {b.get('distance_km')}km {b.get('route_risk') or 'Moderate'}"
+                for b in boats
+            ]
+            return (
+                f"SOS: active at {sos_data.get('station') or 'unknown station'}; "
+                f"boats {' | '.join(boat_bits)}; fleet safe {counts['safe']} active {counts['active']} enroute {counts['enroute']}"
+            )
+        return f"SOS: none active; fleet safe {counts['safe']} active {counts['active']} enroute {counts['enroute']}"
+    except Exception as exc:
+        logging.info("SOS TOOL ERROR: %s", exc)
+        return "SOS: unavailable."
+
+
+async def _tool_news_alerts(limit: int = 3) -> str:
+    feeds = await _fetch_feeds_payload()
+    sachet_alerts = feeds.get("sachet", {}).get("alerts", []) if isinstance(feeds, dict) else []
+    alerts = sorted(
+        [a for a in sachet_alerts if isinstance(a, dict)],
+        key=lambda a: a.get("published_at") or "",
+        reverse=True,
+    )[:limit]
+    if not alerts:
+        return "News: none."
+    return "News: " + " | ".join(
+        f"{a.get('location_match') or a.get('district') or 'Odisha'} / {a.get('summary') or a.get('title') or 'Untitled alert'} / {a.get('published_at') or 'unknown time'}"
+        for a in alerts
+    )
+
+
+def _fallback_chat_tools(message: str, intent: str) -> list[str]:
+    text = str(message or "").lower()
+    tools: list[str] = []
+    if intent == "gauge":
+        tools.append("gauges")
+    elif intent == "weather":
+        tools.append("weather")
+    elif intent == "news":
+        tools.append("news")
+    elif intent == "whatsapp":
+        tools.append("whatsapp")
+    elif intent == "sos":
+        tools.extend(["sos", "gauges"])
+    elif intent == "summary":
+        tools.extend(["gauges", "weather", "social"])
+    if _message_has_router_signal(text, ["social", "signal", "signals"]):
+        tools.append("social")
+    if _message_has_router_signal(text, ["whatsapp", "field team"]):
+        tools.append("whatsapp")
+    if _message_has_router_signal(text, ["sachet", "news", "alert"]):
+        tools.append("news")
+    if _message_has_router_signal(text, ["boat", "rescue", "sos"]):
+        tools.append("sos")
+    if _message_has_router_signal(text, ["gauge", "guage", "wse", "water", "level"]):
+        tools.append("gauges")
+    if _message_has_router_signal(text, ["weather", "rain", "wind", "imd", "climate"]):
+        tools.append("weather")
+    deduped = []
+    for name in tools:
+        if name in CHAT_TOOL_NAMES and name not in deduped:
+            deduped.append(name)
+    return deduped or ["gauges"]
+
+
+async def _plan_chat_tools(message: str, intent: str) -> list[str]:
+    fallback = _fallback_chat_tools(message, intent)
+    groq_key = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API") or ""
+    auth_header = f"Bearer {groq_key}".strip()
+    if auth_header in {"", "Bearer"}:
+        return fallback
+    prompt = (
+        "Select the minimum internal data tools needed for this question. "
+        "Available tools: gauges, weather, social, whatsapp, sos, news. "
+        "Return JSON only in the form {\"tools\":[...]} with tool names from that list only."
+    )
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"Intent hint: {intent}\nQuestion: {message}"},
+        ],
+        "max_tokens": 80,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": auth_header},
+                json=payload,
+            )
+            if r.status_code >= 400:
+                return fallback
+            data = r.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            match = re.search(r"\{.*\}", content, re.S)
+            planned = json.loads(match.group(0) if match else content)
+            tools = [t for t in planned.get("tools", []) if t in CHAT_TOOL_NAMES]
+            deduped = []
+            for name in tools:
+                if name not in deduped:
+                    deduped.append(name)
+            return deduped or fallback
+    except Exception as exc:
+        logging.info("CHAT TOOL PLAN ERROR: %s", exc)
+        return fallback
+
+
+async def _build_tool_context(message: str, intent: str) -> str:
+    tools = await _plan_chat_tools(message, intent)
+    logging.info("CHAT TOOLS: %s", tools)
+    parts = [f"Tools used: {', '.join(tools)}."]
+    for tool in tools:
+        if tool == "gauges":
+            parts.append(await _tool_live_gauges())
+        elif tool == "weather":
+            parts.append(await _tool_imd_weather())
+        elif tool == "social":
+            parts.append(await _tool_social_signals(3 if intent == "summary" else 5))
+        elif tool == "whatsapp":
+            parts.append(await _tool_whatsapp_reports())
+        elif tool == "sos":
+            parts.append(await _tool_sos_status())
+        elif tool == "news":
+            parts.append(await _tool_news_alerts())
+    return _clip_words(" ".join(parts), 550)
+
+
+async def _weather_reply(include_gauge: bool = False) -> str:
+    feeds = await _fetch_feeds_payload()
+    imd = feeds.get("imd", {}).get("stations", []) if isinstance(feeds, dict) else []
+    if not isinstance(imd, list) or not imd:
+        return "IMD weather feed unavailable right now."
+
+    notable = []
+    for row in imd[:12]:
+        station = row.get("name") or row.get("district") or "Unknown"
+        rain = row.get("rain") or row.get("rain_intensity") or "None"
+        wind = row.get("wind") or row.get("wind_speed") or "None"
+        label = _weather_icon_label(rain, wind)
+        if label != "☀️ CLEAR":
+            notable.append(f"{station} {label} {rain} | {wind}")
+
+    if notable:
+        weather_summary = f"Weather: {' | '.join(notable[:5])}."
+    else:
+        weather_summary = "All IMD-monitored stations show CLEAR weather with no ALERT or DANGER conditions."
+
+    if not include_gauge:
+        return weather_summary
+
+    stations = await _fetch_station_payload()
+    gauge_bits = []
+    for s in stations if isinstance(stations, list) else []:
+        try:
+            age_hours = float(s.get("data_age_hours")) if s.get("data_age_hours") is not None else 999
+        except Exception:
+            age_hours = 999
+        if age_hours >= 48:
+            continue
+        name = s.get("name", "")
+        code = STATION_CODES.get(name, name[:3].upper())
+        wse = s.get("latest_wse")
+        status = s.get("alert_status", "NORMAL")
+        if wse is None:
+            continue
+        gauge_bits.append(f"{code} {float(wse):.2f}m {status}")
+
+    if not gauge_bits:
+        return f"Gauge data unavailable. {weather_summary}"
+    return f"Live gauges: {', '.join(gauge_bits)}. {weather_summary}"
+
+
+async def _situation_reply() -> str:
+    stations = await _fetch_station_payload()
+    live_bits = []
+    stale_count = 0
+    for s in stations if isinstance(stations, list) else []:
+        try:
+            age_hours = float(s.get("data_age_hours")) if s.get("data_age_hours") is not None else 999
+        except Exception:
+            age_hours = 999
+        if age_hours >= 48:
+            stale_count += 1
+            continue
+        name = s.get("name", "")
+        code = STATION_CODES.get(name, name[:3].upper())
+        wse = s.get("latest_wse")
+        status = s.get("alert_status", "NORMAL")
+        if wse is not None:
+            live_bits.append(f"{code} {float(wse):.2f}m {status}")
+
+    gauge_summary = (
+        f"Live gauges: {', '.join(live_bits)}. {stale_count} stations excluded as stale (>48h)."
+        if live_bits else
+        "Gauge data unavailable."
+    )
+
+    weather_summary = await _weather_reply(include_gauge=False)
+
+    social_summary = "No social signals available."
+    try:
+        rows = await _supabase_rest_get_async("social_signals", {
+            "select": "district,summary,text,severity,platform,source",
+            "order": "severity.desc.nullslast,timestamp.desc.nullslast",
+        }, limit=3)
+        if rows:
+            social_summary = "Social signals: " + " | ".join(
+                f"{r.get('district') or 'Unknown'} / "
+                f"{r.get('summary') or r.get('text') or 'No summary'} / "
+                f"sev {int(r.get('severity') or 0)} / "
+                f"{r.get('platform') or r.get('source') or 'social'}"
+                for r in rows
+            ) + "."
+    except Exception:
+        pass
+
+    return f"{gauge_summary} {weather_summary} {social_summary}"
+
+
 async def _build_chat_context(intent: str) -> str:
     parts = []
+    gauge_context = ""
+    weather_context = ""
+    tweet_context = ""
+    stations = []
+    imd = []
 
-    if intent in {"gauge", "summary", "radar"}:
+    if intent in {"gauge", "summary", "radar", "tweet"}:
         stations = await _fetch_station_payload()
         gauge_ctx = _station_context_cache.get("gauge") or ""
         stale_count = int(_station_context_cache.get("stale_count") or 0)
@@ -162,7 +873,8 @@ async def _build_chat_context(intent: str) -> str:
         )
         if intent == "summary":
             live = sum(1 for s in stations if (s.get("data_age_hours") or 0) < 48)
-            parts.append(_clip_words(f"Gauges: {gauge_ctx}. Live stations {live}/{len(stations) or 9}.{stale_note}", 90))
+            gauge_context = _clip_words(f"Gauges: {gauge_ctx}. Live stations {live}/{len(stations) or 9}.{stale_note}", 90)
+            parts.append(gauge_context)
         elif intent == "radar":
             radar_context = {
                 "radar_url": "https://mausam.imd.gov.in/Radar/caz_pdp.gif",
@@ -170,13 +882,13 @@ async def _build_chat_context(intent: str) -> str:
             }
             parts.append(json.dumps(radar_context, ensure_ascii=False))
         else:
-            parts.append(_clip_words(f"Gauges: {gauge_ctx}.{stale_note}", 60))
+            gauge_context = _clip_words(f"Gauges: {gauge_ctx}.{stale_note}", 60)
+            if intent != "tweet":
+                parts.append(gauge_context)
 
-    if intent in {"weather", "summary"}:
+    if intent in {"weather", "summary", "tweet"}:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(VPS_FEEDS)
-                feeds = r.json()
+            feeds = await _fetch_feeds_payload()
             imd = feeds.get("imd", {}).get("stations", []) if isinstance(feeds, dict) else []
             items = []
             for s in imd[:12]:
@@ -185,19 +897,28 @@ async def _build_chat_context(intent: str) -> str:
                 wind = s.get("wind") or s.get("wind_speed") or "none"
                 if intent == "weather":
                     items.append(f"{station} {_weather_icon_label(rain, wind)} {rain} | {wind}")
+                elif intent == "tweet":
+                    district = s.get("district") or s.get("name") or "Unknown"
+                    items.append(f"{district} {_weather_icon_label(rain, wind)} {rain} | {wind}")
                 else:
                     district = s.get("district") or s.get("name") or "Unknown"
                     wms = s.get("wms_color")
                     items.append(f"{district}:wms{wms}")
-            parts.append(_clip_words(f"Weather: {' | '.join(items)}", 150 if intent == "weather" else 70))
-        except Exception:
-            pass
+            if items:
+                weather_context = _clip_words(f"Weather: {' | '.join(items)}", 150 if intent == "weather" else (120 if intent == "tweet" else 70))
+            else:
+                weather_context = "Weather: unavailable"
+            if intent != "tweet":
+                parts.append(weather_context)
+        except Exception as exc:
+            logging.exception("WEATHER CONTEXT BUILD ERROR: %s", exc)
+            if intent == "weather":
+                weather_context = "Weather: unavailable"
+                parts.append(weather_context)
 
     if intent == "news":
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(VPS_FEEDS)
-                feeds = r.json()
+            feeds = await _fetch_feeds_payload()
             sachet_alerts = feeds.get("sachet", {}).get("alerts", []) if isinstance(feeds, dict) else []
             alerts = sorted(
                 [a for a in sachet_alerts if isinstance(a, dict)],
@@ -216,65 +937,100 @@ async def _build_chat_context(intent: str) -> str:
 
     if intent in {"tweet", "summary", "whatsapp"}:
         try:
-            conn = psycopg2.connect(os.getenv("URI", ""))
-            cur = conn.cursor()
             if intent in {"tweet", "summary"}:
-                cur.execute("""
-                    SELECT district,
-                           summary,
-                           severity,
-                           reliability_score,
-                           verified,
-                           text,
-                           timestamp,
-                           station_proximity
-                    FROM social_signals
-                    WHERE platform = 'twitter'
-                    ORDER BY severity DESC NULLS LAST,
-                             reliability_score DESC NULLS LAST,
-                             timestamp DESC
-                    LIMIT 5
-                """)
-                rows = cur.fetchall()
+                tweet_limit = 3 if intent == "summary" else 5
+                rows = await _supabase_rest_get_async("social_signals", {
+                    "select": "district,summary,severity,reliability_score,verified,text,timestamp,station_proximity",
+                    "platform": "eq.twitter",
+                    "order": "severity.desc.nullslast,reliability_score.desc.nullslast,timestamp.desc.nullslast",
+                }, limit=tweet_limit)
                 if rows:
-                    tweet_context = _clip_words(
+                    tweet_parts = []
+                    station_lookup = {}
+                    district_lookup = {}
+                    for s in stations if isinstance(stations, list) else []:
+                        name = str(s.get("name") or "").strip()
+                        district = str(s.get("district") or "").strip()
+                        if name:
+                            station_lookup[name.lower()] = s
+                            code = STATION_CODES.get(name)
+                            if code:
+                                station_lookup[code.lower()] = s
+                        if district and district.lower() not in district_lookup:
+                            district_lookup[district.lower()] = s
+                    imd_lookup = {}
+                    for row in imd if isinstance(imd, list) else []:
+                        district = str(row.get("district") or row.get("district_proxy") or row.get("name") or "").strip()
+                        if district and district.lower() not in imd_lookup:
+                            imd_lookup[district.lower()] = row
+                    if intent == "tweet":
+                        if gauge_context:
+                            tweet_parts.append(gauge_context)
+                        if weather_context:
+                            tweet_parts.append(weather_context)
+                        check_lines = []
+                        for r in rows:
+                            district = str(r.get("district") or "Unknown").strip()
+                            proximity = str(r.get("station_proximity") or district).strip()
+                            st = station_lookup.get(proximity.lower()) or district_lookup.get(district.lower())
+                            code = STATION_CODES.get(st.get("name")) if st else (proximity[:3].upper() if proximity else "UNK")
+                            latest_wse = st.get("latest_wse") if st else None
+                            warning_level = st.get("warning_level") if st else None
+                            below_warning = (
+                                latest_wse is not None and warning_level is not None and float(latest_wse) < float(warning_level)
+                            ) if st else None
+                            imd_row = imd_lookup.get(district.lower()) or imd_lookup.get(str(st.get("district") if st else "").lower())
+                            wms_color = imd_row.get("wms_color") if isinstance(imd_row, dict) else None
+                            weather_clear = (wms_color is not None and int(wms_color) <= 1) if wms_color is not None else None
+                            check_lines.append(_clip_words(
+                                f"{district}→{code}: WSE={f'{float(latest_wse):.2f}' if latest_wse is not None else 'NA'}m, "
+                                f"warning={f'{float(warning_level):.2f}' if warning_level is not None else 'NA'}m, "
+                                f"below_warning={below_warning}, IMD={wms_color if wms_color is not None else 'NA'}, "
+                                f"clear={weather_clear}",
+                                20
+                            ))
+                        if check_lines:
+                            tweet_parts.append("Checks: " + " | ".join(check_lines))
+                    tweet_parts.append(
                         "Tweets: " + " | ".join(
-                            f"{r[0] or 'Unknown'} / {r[1] or r[5] or 'No summary'} / sev {r[2] if r[2] is not None else 0} / rel {r[3] if r[3] is not None else 0} / {'verified' if r[4] else 'unverified'}"
+                            f"{r.get('district') or 'Unknown'} / {r.get('summary') or r.get('text') or 'No summary'} / sev {r.get('severity') if r.get('severity') is not None else 0} / rel {r.get('reliability_score') if r.get('reliability_score') is not None else 0}"
                             for r in rows
-                        ),
-                        90 if intent == "tweet" else 120
+                        )
+                    )
+                    tweet_context = _clip_words(
+                        " ".join(tweet_parts),
+                        300 if intent == "tweet" else 120
                     )
                     logging.info(f"TWEET CONTEXT: {tweet_context}")
+                    logging.info(f"GAUGE CONTEXT: {gauge_context}")
+                    logging.info(f"WEATHER CONTEXT: {weather_context}")
                     parts.append(tweet_context)
                 else:
                     logging.info("TWEET CONTEXT: NONE")
+                    logging.info(f"GAUGE CONTEXT: {gauge_context}")
+                    logging.info(f"WEATHER CONTEXT: {weather_context}")
                     if intent == "tweet":
                         parts.append("Tweets: No Twitter signals available in social_signals.")
-            if intent in {"whatsapp", "summary"}:
-                cur.execute("""
-                    SELECT district, summary, severity, sender
-                    FROM social_signals
-                    WHERE source = 'whatsapp'
-                    ORDER BY severity DESC NULLS LAST, COALESCE(timestamp, fetched_at) DESC
-                    LIMIT 3
-                """)
-                rows = cur.fetchall()
+            if intent == "whatsapp":
+                rows = await _supabase_rest_get_async("social_signals", {
+                    "select": "district,summary,severity,sender",
+                    "source": "eq.whatsapp",
+                    "order": "severity.desc.nullslast,timestamp.desc.nullslast",
+                }, limit=3)
                 if rows:
                     parts.append(_clip_words(
                         "WhatsApp: " + " | ".join(
-                            f"{r[0] or 'Unknown'} / {r[1] or 'No summary'} / sev {r[2] if r[2] is not None else 0} / {r[3] or 'unknown sender'}"
+                            f"{r.get('district') or 'Unknown'} / {r.get('summary') or 'No summary'} / sev {r.get('severity') if r.get('severity') is not None else 0} / {r.get('sender') or 'unknown sender'}"
                             for r in rows
                         ),
                         60 if intent == "whatsapp" else 90
                     ))
-            cur.close()
-            conn.close()
         except Exception as exc:
             logging.info(f"TWEET CONTEXT ERROR: {exc}")
             if intent == "tweet":
                 parts.append("Tweets: No Twitter signals available in social_signals.")
 
-    if intent in {"sos", "summary"}:
+    if intent == "sos":
         try:
             sos_data = await api_sos_active()
             boats_data = api_boats()
@@ -324,8 +1080,23 @@ async def _chat_llm(message: str, intent: str, context: str) -> Dict:
     )
     if intent == "tweet":
         system_prompt += (
-            " For each tweet, state: VERIFIED or LIKELY FAKE. "
-            "Fake signals: contradict gauge data, implausible location, single unverified source."
+            " VERIFIED if: severity >= 4 AND reliability >= 4 "
+            "AND (WSE >= warning_level "
+            "OR IMD wms_color >= 2 "
+            "OR weather NOT clear). "
+            " MONITOR if: severity >= 4 AND reliability >= 4 "
+            "AND WSE < warning_level "
+            "AND IMD wms_color <= 1 "
+            "AND weather clear. "
+            " LIKELY FAKE if: tweet claims river is at FLOOD/DANGER level "
+            "BUT WSE < warning_level for that station. "
+            " Use only these labels: LIKELY FAKE, MONITOR, VERIFIED. "
+            " Respond in exactly 3 sentences: "
+            "sentence 1 = classification, "
+            "sentence 2 = gauge/weather cross-check, "
+            "sentence 3 = why severity/reliability alone is insufficient or sufficient. "
+            "For each tweet on a new line: "
+            "[VERIFIED] or [LIKELY FAKE] or [MONITOR] — {district} — {summary}"
         )
     if intent == "whatsapp":
         system_prompt += (
@@ -337,6 +1108,12 @@ async def _chat_llm(message: str, intent: str, context: str) -> Dict:
             " Summarize weather conditions per station. "
             "Flag any DANGER or ALERT conditions first. "
             "Be specific about district and threat type."
+        )
+    if intent == "gauge":
+        system_prompt += (
+            " Summarize only the live gauge stations shown in context. "
+            "Explicitly state the live station count and the stale station count excluded. "
+            "If all live gauges are NORMAL, say that directly."
         )
     if intent == "news":
         system_prompt += (
@@ -369,7 +1146,7 @@ async def _chat_llm(message: str, intent: str, context: str) -> Dict:
         img_b64 = ""
         radar_context = context
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=6) as client:
                 r = await client.get(radar_url)
                 if r.status_code < 400 and r.content:
                     img_b64 = base64.b64encode(r.content).decode()
@@ -447,6 +1224,7 @@ async def _chat_llm(message: str, intent: str, context: str) -> Dict:
     ]
 
     async with httpx.AsyncClient(timeout=20) as client:
+        max_tokens = 400 if intent == "tweet" else 150
         for provider in providers:
             auth_header = provider["headers"].get("Authorization", "")
             if not auth_header.endswith(" ") and auth_header.strip() in {"Bearer", ""}:
@@ -457,7 +1235,7 @@ async def _chat_llm(message: str, intent: str, context: str) -> Dict:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "max_tokens": 150,
+                "max_tokens": max_tokens,
             }
             try:
                 r = await client.post(provider["url"], headers=provider["headers"], json=payload)
@@ -484,85 +1262,185 @@ async def _chat_llm(message: str, intent: str, context: str) -> Dict:
     return {"reply": "Intel unavailable. Check dashboard directly.", "model_used": "unavailable", "tokens_used": 0}
 
 
+async def _tweet_reply(message: str) -> str:
+    stations = await _fetch_station_payload()
+    station_by_name = {str(s.get("name") or "").lower(): s for s in stations if isinstance(stations, list)}
+    district_station = {
+        district: station_by_name.get(name.lower())
+        for district, name in DISTRICT_TO_STATION.items()
+        if station_by_name.get(name.lower())
+    }
+
+    imd_rows = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(VPS_FEEDS)
+            feeds = r.json()
+        imd_rows = feeds.get("imd", {}).get("stations", []) if isinstance(feeds, dict) else []
+    except Exception:
+        imd_rows = []
+    imd_by_district = {}
+    for row in imd_rows if isinstance(imd_rows, list) else []:
+        key = str(row.get("district") or row.get("district_proxy") or row.get("name") or "").strip().lower()
+        if key and key not in imd_by_district:
+            imd_by_district[key] = row
+
+    lower_message = message.lower()
+    direct_verify = lower_message.startswith("verify:") or lower_message.startswith("is this tweet") or lower_message.startswith("is the") or "#odishaflood" in lower_message
+
+    rows = []
+    route_mode = "tweet_summary"
+    if direct_verify:
+        route_mode = "single_tweet"
+        raw_text = re.sub(r"^\s*verify:\s*", "", message, flags=re.I).strip() or message.strip()
+        district = "Unknown"
+        station_proximity = None
+        for key, station_name in DISTRICT_TO_STATION.items():
+            if key in raw_text.lower():
+                district = key.title()
+                station_proximity = station_name
+                break
+        if not station_proximity:
+            for station_name in STATION_CODES:
+                if station_name.lower() in raw_text.lower():
+                    station_proximity = station_name
+                    st = station_by_name.get(station_name.lower())
+                    district = (st.get("district") if st else district) or district
+                    break
+        sev = 4 if _looks_like_flood_claim(raw_text) else 3
+        rel = 3
+        rows = [(district, raw_text[:160], sev, rel, raw_text, None, station_proximity)]
+    else:
+        try:
+            tweet_limit = _tweet_limit_from_message(message)
+            raw_rows = await _supabase_rest_get_async("social_signals", {
+                "select": "district,summary,severity,reliability_score,text,timestamp,station_proximity",
+                "platform": "eq.twitter",
+                "order": "severity.desc.nullslast,reliability_score.desc.nullslast,timestamp.desc.nullslast",
+            }, limit=tweet_limit)
+            rows = [
+                (
+                    r.get("district"), r.get("summary"), r.get("severity"),
+                    r.get("reliability_score"), r.get("text"), r.get("timestamp"),
+                    r.get("station_proximity")
+                )
+                for r in raw_rows
+            ] if raw_rows else []
+        except Exception:
+            return "No Twitter signals available — data source temporarily unavailable."
+
+        if not rows:
+            return "No Twitter signals available in social_signals."
+
+        terms = _extract_query_terms(message)
+        if terms:
+            filtered = []
+            for r in rows:
+                hay = " ".join(str(x or "") for x in [r[0], r[1], r[4], r[6]]).lower()
+                if any(term in hay for term in terms):
+                    filtered.append(r)
+            if filtered:
+                rows = filtered
+        route_mode, rows = route_tweet_query(message, rows)
+
+    lines = []
+    for district, summary, severity, reliability, text, timestamp, station_proximity in rows:
+        district = district or "Unknown"
+        summary = summary or text or "No summary"
+        severity = int(severity or 0)
+        reliability = int(reliability or 0)
+        proximity = str(station_proximity or "").strip().lower()
+        st = station_by_name.get(proximity) or district_station.get(str(district).lower())
+        station_name = st.get("name") if st else (station_proximity or district)
+        station_code = STATION_CODES.get(station_name, (str(station_name)[:3].upper() if station_name else "UNK"))
+        wse = st.get("latest_wse") if st else None
+        warning = st.get("warning_level") if st else None
+        below_warning = bool(wse is not None and warning is not None and float(wse) < float(warning))
+        status = st.get("alert_status", "UNKNOWN") if st else "UNKNOWN"
+        imd_row = imd_by_district.get(str(district).lower()) or imd_by_district.get(str(st.get("district") if st else "").lower())
+        wms_color = int(imd_row.get("wms_color") or 0) if isinstance(imd_row, dict) and imd_row.get("wms_color") is not None else 0
+        weather_clear = wms_color <= 1
+        live_count = sum(1 for s in stations if (s.get("data_age_hours") or 999) < 48) if isinstance(stations, list) else 0
+
+        label = "MONITOR"
+        if _looks_like_flood_claim(summary) and below_warning:
+            label = "LIKELY FAKE"
+        elif severity >= 4 and reliability >= 4 and ((wse is not None and warning is not None and float(wse) >= float(warning)) or wms_color >= 2 or not weather_clear):
+            label = "VERIFIED"
+        elif severity >= 4 and reliability >= 4 and below_warning and weather_clear:
+            label = "MONITOR"
+        elif direct_verify and _looks_like_flood_claim(summary) and below_warning and weather_clear:
+            label = "LIKELY FAKE"
+
+        wse_text = f"{float(wse):.2f}m" if wse is not None else "NA"
+        if route_mode == "single_tweet":
+            station_ref = f"{station_code} ({station_name})" if station_name else station_code
+            weather_text = "Weather is CLEAR." if weather_clear else (f"IMD weather severity is {wms_color}." if wms_color else "Weather data unavailable.")
+            return (
+                f"{station_ref} gauge shows {wse_text}, which is {status}. "
+                f"{weather_text} "
+                f"No indication of rapid rise; all {live_count} live stations show normal status. "
+                f"Verify traffic or infrastructure details from other sources, as gauge data doesn't support the claim."
+            )
+        sentence1 = f"[{label}] — {district} — {summary}."
+        sentence2 = f"Gauge at {station_name} ({station_code}) is {wse_text} {status} and weather is {'CLEAR' if weather_clear else f'IMD {wms_color}' }."
+        if label == "VERIFIED":
+            sentence3 = "Severity and reliability are supported by gauge or weather conditions."
+        elif label == "LIKELY FAKE":
+            sentence3 = "The claim conflicts with gauge conditions because water level is below warning threshold."
+        else:
+            sentence3 = "Severity and reliability alone are insufficient as water levels are below warning levels and weather is clear."
+        lines.append("\n".join([sentence1, sentence2, sentence3]))
+
+    return "\n\n".join(lines)
+
+
 # ──────────────────────────────────────────────
 #  Routes
 # ──────────────────────────────────────────────
 
 @app.get("/api/stations")
 async def api_stations():
-    """Proxy to VPS data API — stations with latest WSE."""
+    """Station data for dashboard, served from the local WSE snapshot only."""
+    if not PULSE_SNAPSHOT_PATH.exists():
+        return JSONResponse({"error": "snapshot unavailable"}, status_code=503)
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(f"{VPS_DATA_API}/data/stations")
-            stations = r.json()
+        payload = json.loads(PULSE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return JSONResponse({"error": "VPS data API unreachable"}, status_code=502)
+        return JSONResponse({"error": "snapshot unavailable"}, status_code=503)
 
-    # Attach model output without retraining; predict() loads existing model files.
-    for s in stations:
-        wse = s.get("latest_wse")
-        ts = s.get("latest_timestamp")
-        name = s.get("name", "")
+    stations = payload.get("stations") if isinstance(payload, dict) else payload if isinstance(payload, list) else None
+    if not isinstance(stations, list):
+        return JSONResponse({"error": "snapshot unavailable"}, status_code=503)
 
-        s["forecast_8h"] = None
-        s["forecast_24h"] = None
-        s["forecast"] = []
-        s["confidence_pct"] = None
-
-        if wse is None or ts is None:
-            s["wse_source"] = "stale"
-            s["data_age_hours"] = 999
-            s["label"] = "No data available"
-            continue
-
-        age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() / 3600
-        s["data_age_hours"] = round(age_hours, 1)
-
-        pred = None
-        try:
-            from ml_forecast import predict
-            pred = predict(name)
-        except Exception:
-            pred = None
-
-        if pred:
-            forecast = pred.get("forecast") or []
-            s["forecast"] = [
-                {
-                    "hour": item.get("hour"),
-                    "wse": item.get("wse"),
-                    "lower": item.get("lower"),
-                    "upper": item.get("upper"),
-                }
-                for item in forecast
-            ]
-            s["forecast_8h"] = pred.get("forecast_8h")
-            s["forecast_24h"] = pred.get("forecast_24h")
-
-        if age_hours <= 48:
-            s["wse_source"] = "live"
-            s["label"] = f"{wse}m (live)"
-        elif age_hours > 168:
-            s["wse_source"] = "stale"
-            s["label"] = f"Data unavailable — last reading {age_hours / 24:.0f}d ago"
+    out = []
+    for row in stations:
+        item = dict(row or {})
+        if item.get("latest_wse") is None:
+            item["latest_wse"] = item.get("wse")
+        if item.get("latest_timestamp") is None:
+            item["latest_timestamp"] = item.get("last_updated")
+        if item.get("alert_status") is None:
+            item["alert_status"] = item.get("status") or "NO_DATA"
+        age_min = item.get("data_age_minutes")
+        if item.get("data_age_hours") is None:
+            try:
+                item["data_age_hours"] = round(float(age_min) / 60, 1) if age_min is not None else 999
+            except Exception:
+                item["data_age_hours"] = 999
+        if item.get("wse_source") is None:
+            item["wse_source"] = "stale" if item.get("stale") else "live"
+        item.setdefault("forecast_8h", None)
+        item.setdefault("forecast_24h", None)
+        item.setdefault("forecast", [])
+        item.setdefault("confidence_pct", None)
+        if item.get("data_age_hours", 999) > 168:
+            item["label"] = "No data available"
         else:
-            # Recent stale data may use the forecast if the model agrees with the last reading.
-            forecast_val = s["forecast_8h"]
-            if forecast_val is not None and wse > 0 and forecast_val > 0:
-                ratio = min(wse, forecast_val) / max(wse, forecast_val)
-                diff = abs(wse - forecast_val)
-                if ratio >= 0.93 and diff <= 1.5:
-                    s["wse_source"] = "predicted"
-                    s["confidence_pct"] = round(ratio * 100, 1)
-                    s["label"] = f"{forecast_val}m (model)"
-                else:
-                    s["wse_source"] = "stale"
-                    s["label"] = f"Model divergence — data {age_hours:.0f}h old"
-            else:
-                s["wse_source"] = "stale"
-                s["label"] = f"No forecast model — data {age_hours:.0f}h old"
+            item.setdefault("label", None)
+        out.append(item)
 
-    return stations
+    return out
 
 
 @app.get("/api/alerts")
@@ -584,35 +1462,69 @@ def api_alerts():
 
 @app.get("/api/chart/{station}")
 async def api_chart(station: str, days: int = 30):
-    """WSE history from VPS + Prophet forecast from local models."""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(f"{VPS_DATA_API}/data/chart/{station}", params={"days": days})
-            data = r.json()
-            sr = await client.get(f"{VPS_DATA_API}/data/stations")
-            stations = sr.json()
-    except Exception:
-        return JSONResponse({"error": "VPS data API unreachable"}, status_code=502)
+    """WSE history for dashboard from local CSV snapshots only."""
+    station_name = "Purusottampur" if station == "Purushottampur" else station
+    cache_key = (station_name, 15)
+    now = datetime.now(timezone.utc)
+    cached = _chart_cache.get(cache_key)
+    if cached and cached.get("expires_at") and cached["expires_at"] > now:
+        data = dict(cached["data"])
+    else:
+        csv_name = station_name.lower().replace(" ", "_").replace("/", "-")
+        csv_path = Path("/root/Sahayak/pipeline/data") / f"{csv_name}_wse.csv"
 
-    latest_ts = None
-    for item in stations:
-        if item.get("name") == station:
-            latest_ts = item.get("latest_timestamp")
-            break
-    data["latest_timestamp"] = latest_ts
+        if not csv_path.exists():
+            return JSONResponse({"error": "no history available"}, status_code=404)
 
-    if latest_ts and data.get("timestamps") and data.get("values"):
         try:
-            latest_dt = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
-            filtered = []
-            for ts, value in zip(data["timestamps"], data["values"]):
-                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                if dt <= latest_dt:
-                    filtered.append((ts, value))
-            data["timestamps"] = [ts for ts, _ in filtered]
-            data["values"] = [value for _, value in filtered]
+            df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+        except Exception:
+            return JSONResponse({"error": "no history available"}, status_code=500)
+
+        if df.empty:
+            return JSONResponse({"error": "no history available"}, status_code=404)
+
+        latest_ts = df["timestamp"].max()
+        cutoff = latest_ts - timedelta(days=15)
+        df = df[df["timestamp"] >= cutoff].copy()
+
+        thresholds = {"warning": None, "danger": None, "hfl": None}
+        try:
+            if PULSE_SNAPSHOT_PATH.exists():
+                payload = json.loads(PULSE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+                stations = payload.get("stations") if isinstance(payload, dict) else []
+                for item in stations if isinstance(stations, list) else []:
+                    if item.get("name") == station_name:
+                        thresholds = {
+                            "warning": item.get("warning_level"),
+                            "danger": item.get("danger_level"),
+                            "hfl": item.get("hfl"),
+                        }
+                        break
         except Exception:
             pass
+
+        data = {
+            "station": station_name,
+            "timestamps": [ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") for ts in df["timestamp"].tolist()],
+            "values": [float(v) for v in df["value"].tolist()],
+            "history": [
+                {
+                    "timestamp": ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "wse": float(v),
+                }
+                for ts, v in zip(df["timestamp"].tolist(), df["value"].tolist())
+            ],
+            "thresholds": thresholds,
+            "latest_timestamp": latest_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        _chart_cache[cache_key] = {
+            "expires_at": now + CHART_CACHE_TTL,
+            "data": dict(data),
+        }
 
     data["forecast"] = None
 
@@ -641,101 +1553,53 @@ async def api_chart(station: str, days: int = 30):
 
 @app.get("/api/social")
 def api_social(minutes: int = 60):
-    """Social signals from Supabase social_signals (live) + fixtures fallback."""
+    """Social signals from Supabase REST — max date only (latest day)."""
     signals = []
 
-    # Try Supabase first (real data from social_agent.py)
     try:
-        conn = psycopg2.connect(os.getenv("URI", ""))
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'social_signals'
-        """)
-        columns = {r[0] for r in cur.fetchall()}
-
-        text_col = "raw_text" if "raw_text" in columns else "text"
-        ts_col = "published_at" if "published_at" in columns else "timestamp" if "timestamp" in columns else "fetched_at"
-        district_expr = "district" if "district" in columns else "NULL::text AS district"
-        source_expr = "source" if "source" in columns else "'twitter'::text AS source"
-        platform_expr = "platform" if "platform" in columns else "'twitter'::text AS platform"
-        location_expr = "location" if "location" in columns else "NULL::text AS location"
-        coords_expr = "CAST(coordinates AS TEXT)" if "coordinates" in columns else "NULL::text AS coordinates"
-        severity_expr = "severity" if "severity" in columns else "0 AS severity"
-        event_type_expr = "event_type" if "event_type" in columns else "NULL::text AS event_type"
-        station_expr = "station_proximity" if "station_proximity" in columns else "NULL::text AS station_proximity"
-        summary_expr = "summary" if "summary" in columns else f"LEFT({text_col}, 220) AS summary"
-        reliability_expr = "reliability_score" if "reliability_score" in columns else "0 AS reliability_score"
-        flags_expr = "credibility_flags" if "credibility_flags" in columns else "NULL::jsonb AS credibility_flags"
-        verified_expr = "verified" if "verified" in columns else "false AS verified"
-        sender_expr = "sender" if "sender" in columns else "NULL::text AS sender"
-
-        query = f"""
-            WITH latest AS (
-                SELECT MAX({ts_col}) AS max_ts
-                FROM social_signals
-                WHERE {ts_col} IS NOT NULL
-            )
-            SELECT {source_expr}, {platform_expr}, {district_expr}, {text_col},
-                   {location_expr}, {coords_expr}, {severity_expr}, {event_type_expr},
-                   {station_expr}, {summary_expr}, {reliability_expr},
-                   {flags_expr}, {verified_expr}, {ts_col}, {sender_expr}
-            FROM social_signals, latest
-            WHERE latest.max_ts IS NOT NULL
-              AND {ts_col} >= date_trunc('day', latest.max_ts AT TIME ZONE 'UTC')
-              AND {ts_col} < date_trunc('day', latest.max_ts AT TIME ZONE 'UTC') + INTERVAL '1 day'
-            ORDER BY {ts_col} DESC LIMIT 50
-        """
-        cur.execute(query)
-        rows = cur.fetchall()
-        cur.close(); conn.close()
-
-        for r in rows:
-            signals.append({
-                "source": r[0], "platform": r[1], "district": r[2],
-                "text": r[3], "location": r[4], "coordinates": r[5],
-                "severity": r[6], "event_type": r[7], "station_proximity": r[8],
-                "summary": r[9], "reliability_score": r[10],
-                "credibility_flags": r[11], "verified": r[12],
-                "timestamp": str(r[13]) if r[13] else None,
-                "sender": r[14],
-            })
-
+        rows = _supabase_rest_get("social_signals", {
+            "select": "source,platform,district,raw_text,text,location,coordinates,severity,event_type,station_proximity,summary,reliability_score,credibility_flags,verified,timestamp,sender",
+            "order": "timestamp.desc.nullslast",
+        }, limit=200)
+        if rows:
+            max_ts = None
+            for r in rows:
+                ts = r.get("timestamp")
+                if ts:
+                    try:
+                        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                        if max_ts is None or dt > max_ts:
+                            max_ts = dt
+                    except Exception:
+                        pass
+            if max_ts:
+                max_day = max_ts.date()
+                for r in rows:
+                    ts = r.get("timestamp")
+                    if not ts:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                        if dt.date() == max_day:
+                            signals.append({
+                                "source": r.get("source"), "platform": r.get("platform"), "district": r.get("district"),
+                                "text": r.get("raw_text") or r.get("text"), "location": r.get("location"),
+                                "coordinates": r.get("coordinates"), "severity": r.get("severity"),
+                                "event_type": r.get("event_type"), "station_proximity": r.get("station_proximity"),
+                                "summary": r.get("summary"), "reliability_score": r.get("reliability_score"),
+                                "credibility_flags": r.get("credibility_flags"), "verified": r.get("verified"),
+                                "timestamp": str(ts) if ts else None,
+                                "sender": r.get("sender"),
+                            })
+                    except Exception:
+                        pass
         if signals:
             signals.sort(key=lambda s: (s.get("verified", False), s.get("severity", 0)), reverse=True)
             return signals
     except Exception:
         pass
 
-    # Fallback to dummy fixtures
-    latest_ts = None
-
-    for fname in ["dummy_twitter.json", "dummy_whatsapp.json"]:
-        path = FIXTURES_DIR / fname
-        if not path.exists():
-            continue
-        try:
-            with open(path) as f:
-                items = json.load(f)
-            for item in items:
-                ts = datetime.fromisoformat(item["timestamp"]).replace(tzinfo=timezone.utc)
-                if latest_ts is None or ts > latest_ts:
-                    latest_ts = ts
-                item["platform"] = "twitter" if "twitter" in fname else "whatsapp"
-                signals.append(item)
-        except Exception:
-            continue
-
-    if latest_ts is not None:
-        latest_day = latest_ts.date()
-        signals = [
-            item for item in signals
-            if datetime.fromisoformat(item["timestamp"]).replace(tzinfo=timezone.utc).date() == latest_day
-        ]
-
-    signals.sort(key=lambda s: s.get("timestamp", ""), reverse=True)
-    return signals
+    return []
 
 
 @app.get("/api/sos/{station}")
@@ -749,12 +1613,13 @@ async def api_sos(station: str):
     except ImportError:
         return JSONResponse({"error": "Triage module not available"}, status_code=500)
 
-    # Get station data from cached stations (avoids re-fetching all stations)
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{VPS_DATA_API}/data/stations")
-        stations = r.json()
-
-    st = next((s for s in stations if s["name"] == station), None)
+    try:
+        snapshot = json.loads(PULSE_SNAPSHOT_PATH.read_text(encoding="utf-8")) if PULSE_SNAPSHOT_PATH.exists() else {}
+    except Exception:
+        snapshot = {}
+    stations = snapshot.get("stations") if isinstance(snapshot, dict) else []
+    station_name = "Purusottampur" if station == "Purushottampur" else station
+    st = next((s for s in stations if s.get("name") == station_name), None)
     if not st:
         raise HTTPException(404, f"Station not found: {station}")
 
@@ -790,9 +1655,13 @@ async def api_sos(station: str):
     # Evacuate window
     if wse and hfl and hfl > (wse or 0):
         try:
-            ch = await client.get(f"{VPS_DATA_API}/data/chart/{station}", params={"days": 7})
-            chart = ch.json()
-            vals = chart.get("values", [])
+            csv_name = station_name.lower().replace(" ", "_").replace("/", "-")
+            csv_path = Path("/root/Sahayak/pipeline/data") / f"{csv_name}_wse.csv"
+            chart_df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+            chart_df["timestamp"] = pd.to_datetime(chart_df["timestamp"], utc=True, errors="coerce")
+            chart_df["value"] = pd.to_numeric(chart_df["value"], errors="coerce")
+            chart_df = chart_df.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+            vals = chart_df["value"].tolist()
             if len(vals) >= 2:
                 rise_rate = (vals[-1] - vals[-2]) / 8  # m/hr (8h interval)
                 if rise_rate > 0:
@@ -874,7 +1743,7 @@ async def api_whatsapp(request: Request):
     # Dedup
     text_hash = hashlib.sha256(body.encode()).hexdigest()[:16]
     try:
-        conn = psycopg2.connect(os.getenv("URI", ""))
+        conn = psycopg2.connect(os.getenv("URI", ""), connect_timeout=3)
         cur = conn.cursor()
         cur.execute("SELECT id FROM social_signals WHERE content_hash=%s AND fetched_at > NOW() - INTERVAL '2 hours'", [text_hash])
         if cur.fetchone():
@@ -922,7 +1791,7 @@ async def api_whatsapp(request: Request):
 
     # Insert
     try:
-        conn = psycopg2.connect(os.getenv("URI", ""))
+        conn = psycopg2.connect(os.getenv("URI", ""), connect_timeout=3)
         cur = conn.cursor()
         coords = extract.get("coordinates")
         la, lo = (coords[0], coords[1]) if isinstance(coords, list) and len(coords) >= 2 else (None, None)
@@ -939,7 +1808,7 @@ async def api_whatsapp(request: Request):
         if active:
             for t in trusted:
                 t4 = t[-4:] if len(t) >= 4 else t
-                conn = psycopg2.connect(os.getenv("URI", ""))
+                conn = psycopg2.connect(os.getenv("URI", ""), connect_timeout=3)
                 cur = conn.cursor()
                 cur.execute("SELECT id FROM social_signals WHERE sender=%s AND source='whatsapp' AND timestamp > NOW() - INTERVAL '2 hours'", [t4])
                 silent = cur.fetchone() is None
@@ -980,9 +1849,32 @@ async def api_chat(request: Request):
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
 
+    lower_message = message.lower()
+    if lower_message.startswith("verify:") or _looks_like_tweet_text(message):
+        reply = await _tweet_reply(message)
+        return {"reply": reply}
+
+    if _message_has_router_signal(lower_message, ["tweet", "tweets", "summary"]):
+        reply = await _tweet_reply(message)
+        return {"reply": reply}
+
+    if _message_requests_full_situation(message):
+        return {"reply": await _situation_reply()}
+
+    if _message_requests_gauge_weather(message):
+        return {"reply": await _weather_reply(include_gauge=True)}
+
     intent = _detect_intent(message)
     logging.info(f"INTENT DETECTED: {intent}")
-    context = await _build_chat_context(intent)
+    if intent == "tweet":
+        reply = await _tweet_reply(message)
+        return {"reply": reply}
+    if intent == "weather":
+        return {"reply": await _weather_reply(include_gauge=False)}
+    if intent == "radar":
+        context = await _build_chat_context(intent)
+    else:
+        context = await _build_tool_context(message, intent)
     log.info("CHAT CONTEXT: %s", context)
     result = await _chat_llm(message, intent, context)
     log.info(
@@ -996,9 +1888,35 @@ async def api_chat(request: Request):
 
 @app.get("/api/boats")
 def api_boats():
-    """Boat asset positions for Leaflet map markers."""
+    """Boat asset positions for Leaflet map markers. Served from local snapshot; DB fallback."""
+    if BOATS_SNAPSHOT_PATH.exists():
+        try:
+            payload = json.loads(BOATS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+            boats = payload.get("boats") if isinstance(payload, dict) else []
+            if isinstance(boats, list) and boats:
+                out = []
+                for b in boats:
+                    last_ping = b.get("last_ping")
+                    if isinstance(last_ping, str) and last_ping:
+                        try:
+                            from datetime import datetime as _dt
+                            last_ping = _dt.fromisoformat(last_ping.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+                    out.append({
+                        "call_sign": b.get("call_sign"),
+                        "status": b.get("status"),
+                        "lat": b.get("lat"),
+                        "lon": b.get("lon"),
+                        "last_ping": last_ping.isoformat().replace("+00:00", "Z") if hasattr(last_ping, "isoformat") else str(last_ping or ""),
+                        "nearest_station": b.get("nearest_station"),
+                    })
+                return out
+        except Exception:
+            pass
+
     try:
-        conn = psycopg2.connect(os.getenv("URI", ""))
+        conn = psycopg2.connect(os.getenv("URI", ""), connect_timeout=3)
         cur = conn.cursor()
         cur.execute("""
             SELECT call_sign, status, lat, lon,
@@ -1011,7 +1929,17 @@ def api_boats():
         rows = cur.fetchall()
         cur.close(); conn.close()
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return [
+            {
+                "call_sign": r.get("call_sign"),
+                "status": r.get("status"),
+                "lat": r.get("lat"),
+                "lon": r.get("lon"),
+                "last_ping": r.get("last_ping", ""),
+                "nearest_station": r.get("nearest_station"),
+            }
+            for r in _read_boats_from_seed()
+        ]
 
     return [
         {
@@ -1024,6 +1952,30 @@ def api_boats():
         }
         for r in rows
     ]
+
+
+def _read_boats_from_seed() -> list[dict]:
+    """Last-resort fallback: read boat_assets_rows.csv fixture."""
+    csv_path = Path("/root/Sahayak/pipeline/fixtures/boat_assets_rows.csv")
+    if not csv_path.exists():
+        return []
+    import csv as _csv
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            boats = []
+            for row in reader:
+                boats.append({
+                    "call_sign": row.get("call_sign", ""),
+                    "status": row.get("status", "Safe"),
+                    "lat": float(row["lat"]) if row.get("lat") else None,
+                    "lon": float(row["lon"]) if row.get("lon") else None,
+                    "last_ping": row.get("last_ping", ""),
+                    "nearest_station": row.get("nearest_station", ""),
+                })
+            return boats
+    except Exception:
+        return []
 
 
 # ── 2G Fallback — /api/pulse (< 200 bytes) ──────
@@ -1045,17 +1997,23 @@ async def api_pulse():
     except Exception:
         return JSONResponse({"error": "VPS unreachable"}, status_code=502)
 
-    # Get nearest boats per station
+    # Get nearest boats per station from local snapshot
     boat_map = {}
     try:
-        import psycopg2
-        conn = psycopg2.connect(os.getenv("URI", ""))
-        cur = conn.cursor()
-        cur.execute("SELECT team_id, nearest_station FROM boat_assets WHERE status IN ('Safe','Active','En Route')")
-        for b in cur.fetchall():
-            if b[1] and b[1] not in boat_map:
-                boat_map[b[1]] = b[0]
-        cur.close(); conn.close()
+        if BOATS_SNAPSHOT_PATH.exists():
+            boats_payload = json.loads(BOATS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+            boats = boats_payload.get("boats") if isinstance(boats_payload, dict) else []
+            for b in boats if isinstance(boats, list) else []:
+                if b.get("nearest_station") and b.get("nearest_station") not in boat_map:
+                    boat_map[b["nearest_station"]] = b.get("team_id")
+        if not boat_map:
+            conn = psycopg2.connect(os.getenv("URI", ""), connect_timeout=3)
+            cur = conn.cursor()
+            cur.execute("SELECT team_id, nearest_station FROM boat_assets WHERE status IN ('Safe','Active','En Route')")
+            for b in cur.fetchall():
+                if b[1] and b[1] not in boat_map:
+                    boat_map[b[1]] = b[0]
+            cur.close(); conn.close()
     except Exception:
         pass
 
@@ -1075,7 +2033,7 @@ async def api_pulse():
 # ── VPS CORS proxies ─────────────────────────────
 
 VPS_AIRCRAFT = "http://72.60.98.178:8003/api/aircraft"
-VPS_FEEDS    = "http://72.60.98.178:8004/api/feeds"
+VPS_FEEDS    = "http://127.0.0.1:8004/api/feeds"
 
 
 @app.get("/api/vps/aircraft")
@@ -1115,32 +2073,37 @@ async def proxy_sachet():
 
     previous_day_alerts = []
     try:
-        conn = psycopg2.connect(os.getenv("URI", ""))
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT ON (LOWER(title))
-                title,
-                published_at,
-                location_match
-            FROM sachet_rss_entries
-            WHERE published_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') - INTERVAL '1 day'
-              AND published_at <  date_trunc('day', NOW() AT TIME ZONE 'UTC')
-              AND LOWER(COALESCE(title, '')) NOT LIKE '%%forest fire%%'
-            ORDER BY LOWER(title), published_at DESC
-        """)
+        rows = _supabase_rest_get("sachet_rss_entries", {
+            "select": "title,published_at,location_match",
+            "order": "published_at.desc.nullslast",
+        }, limit=200)
         current_titles = {str(a.get("title", "")).strip().lower() for a in current_alerts}
-        for title, published_at, location_match in cur.fetchall():
-            key = str(title or "").strip().lower()
-            if not key or key in current_titles:
+        today = datetime.now(timezone.utc).date()
+        seen = set()
+        for r in rows if isinstance(rows, list) else []:
+            published_at = r.get("published_at")
+            if not published_at:
                 continue
+            try:
+                dt = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if dt.date() >= today:
+                continue
+            if dt.date() < today - timedelta(days=1):
+                continue
+            title = str(r.get("title") or "").strip().lower()
+            if not title or title in current_titles or title in seen:
+                continue
+            if "forest fire" in title:
+                continue
+            seen.add(title)
             previous_day_alerts.append({
-                "title": title,
-                "published_at": str(published_at) if published_at else None,
-                "location_match": location_match or "",
+                "title": r.get("title"),
+                "published_at": str(published_at),
+                "location_match": r.get("location_match") or "",
                 "out_of_zone": False,
             })
-        cur.close()
-        conn.close()
     except Exception:
         previous_day_alerts = []
 

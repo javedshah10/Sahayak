@@ -111,7 +111,7 @@ FLOOD_KEYWORDS = [k.lower() for k in KEYWORDS]
 
 
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=3)
 
 
 def hash_text(s): return hashlib.sha256(s.encode()).hexdigest()[:16]

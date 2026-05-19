@@ -9,10 +9,13 @@ Usage:
 """
 
 import math
+import csv as _csv
 import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Dict, Optional
 
 import psycopg2
@@ -22,8 +25,9 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 DATABASE_URL = os.getenv("URI", "")
 
-if not DATABASE_URL:
-    raise RuntimeError("Set URI in .env for Supabase connection")
+BOATS_SNAPSHOT_PATH = Path("/root/Sahayak/pipeline/snapshots/boats_latest.json")
+BOATS_CSV_PATH = Path("/root/Sahayak/pipeline/fixtures/boat_assets_rows.csv")
+_db_unavailable = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("SahayakMap.Triage")
@@ -38,34 +42,107 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return round(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)), 2)
 
 
+def _load_boats_from_snapshot() -> list[dict]:
+    """Load boats from local snapshot file. Falls back to CSV seed."""
+    snapshot = None
+    if BOATS_SNAPSHOT_PATH.exists():
+        try:
+            snapshot = json.loads(BOATS_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    if isinstance(snapshot, dict) and snapshot.get("boats"):
+        return snapshot["boats"]
+
+    boats = []
+    if BOATS_CSV_PATH.exists():
+        try:
+            with open(BOATS_CSV_PATH, newline="", encoding="utf-8") as f:
+                reader = _csv.DictReader(f)
+                for row in reader:
+                    boats.append({
+                        "call_sign": row.get("call_sign", ""),
+                        "team_id": row.get("team_id", ""),
+                        "lat": float(row["lat"]) if row.get("lat") else None,
+                        "lon": float(row["lon"]) if row.get("lon") else None,
+                        "status": row.get("status", "Safe"),
+                        "nearest_station": row.get("nearest_station", ""),
+                        "district": row.get("district", ""),
+                        "last_ping": row.get("last_ping", ""),
+                    })
+        except Exception:
+            pass
+    return boats
+
+
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=3)
 
 
 def nearest_boats(lat: float, lon: float, limit: int = 5) -> List[Dict]:
-    """Query boat_assets for Safe/Active boats with recent pings, sorted by distance."""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT team_id, call_sign, lat, lon, status, nearest_station, district, last_ping
-        FROM boat_assets
-        WHERE status IN ('Safe', 'Active', 'En Route')
-          AND last_ping > NOW() - INTERVAL '24 hours'
-    """)
+    """Query boat_assets for Safe/Active boats with recent pings, sorted by distance.
+    Falls back to local snapshot when DB is unavailable."""
+    global _db_unavailable
+    if not _db_unavailable and DATABASE_URL:
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT team_id, call_sign, lat, lon, status, nearest_station, district, last_ping
+                FROM boat_assets
+                WHERE status IN ('Safe', 'Active', 'En Route')
+                  AND last_ping > NOW() - INTERVAL '24 hours'
+            """)
+            boats = []
+            for r in cur.fetchall():
+                dist = haversine(lat, lon, r[2], r[3])
+                boats.append({"team_id": r[0], "call_sign": r[1], "lat": r[2], "lon": r[3],
+                               "status": r[4], "nearest_station": r[5], "district": r[6],
+                               "last_ping": str(r[7])[:19], "distance_km": dist})
+            cur.close()
+            conn.close()
+            if boats:
+                _db_unavailable = False
+                boats.sort(key=lambda b: b["distance_km"])
+                return boats[:limit]
+        except Exception as exc:
+            log.warning("DB boat query failed: %s — using local snapshot", exc)
+            _db_unavailable = True
+
     boats = []
-    for r in cur.fetchall():
-        dist = haversine(lat, lon, r[2], r[3])
-        boats.append({"team_id": r[0], "call_sign": r[1], "lat": r[2], "lon": r[3],
-                       "status": r[4], "nearest_station": r[5], "district": r[6],
-                       "last_ping": str(r[7])[:19], "distance_km": dist})
-    cur.close()
-    conn.close()
+    now = datetime.now(timezone.utc)
+    for b in _load_boats_from_snapshot():
+        b_lat = b.get("lat")
+        b_lon = b.get("lon")
+        if b_lat is None or b_lon is None:
+            continue
+        status = str(b.get("status") or "").strip()
+        if status not in ("Safe", "Active", "En Route"):
+            continue
+        dist = haversine(lat, lon, b_lat, b_lon)
+        boats.append({
+            "team_id": b.get("team_id", ""),
+            "call_sign": b.get("call_sign", ""),
+            "lat": b_lat,
+            "lon": b_lon,
+            "status": status,
+            "nearest_station": b.get("nearest_station", ""),
+            "district": b.get("district", ""),
+            "last_ping": str(b.get("last_ping", ""))[:19],
+            "distance_km": dist,
+        })
+
+    if not boats:
+        return []
+
     boats.sort(key=lambda b: b["distance_km"])
     return boats[:limit]
 
 
 def road_risk_check(boat: Dict) -> Optional[Dict]:
     """Check road_risks table for elevated risk on boat's nearest station."""
+    if _db_unavailable:
+        return None
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -87,6 +164,8 @@ def road_risk_check(boat: Dict) -> Optional[Dict]:
 
 def nearest_safe_zone(district: str) -> Optional[Dict]:
     """Recommend nearest safe zone in the given district."""
+    if _db_unavailable:
+        return None
     try:
         conn = get_db()
         cur = conn.cursor()
